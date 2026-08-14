@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import multiprocessing
 import os
 import threading
 import _thread
@@ -20,6 +21,8 @@ RUNTIME_SCHEDULER_FORCE_ENABLED_ENV = "DSA_RUNTIME_SCHEDULER_FORCE_ENABLED"
 RUNTIME_SCHEDULER_RUN_IMMEDIATELY_ENV = "DSA_RUNTIME_SCHEDULER_RUN_IMMEDIATELY"
 RUNTIME_SCHEDULER_SUPPRESS_START_ENV = "DSA_RUNTIME_SCHEDULER_SUPPRESS_START"
 RUNTIME_SCHEDULER_ARGS_ENV = "DSA_RUNTIME_SCHEDULER_ARGS"
+RUNTIME_SCHEDULER_TIMEOUT_ENV = "DSA_RUNTIME_SCHEDULER_TIMEOUT_SECONDS"
+DEFAULT_RUNTIME_SCHEDULER_TIMEOUT_SECONDS = 45 * 60
 _RUNTIME_ANALYSIS_LOCK = threading.Lock()
 SCHEDULE_ARGS_OVERRIDE_KEYS = {
     "no_notify",
@@ -172,7 +175,7 @@ class RuntimeSchedulerService:
         self._last_skip_reason = "analysis_already_running"
         logger.warning("Runtime scheduler skipped run: analysis already running")
 
-    def _run_analysis_locked(self, stock_codes: Optional[List[str]]) -> None:
+    def _run_analysis_locked(self, stock_codes: Optional[List[str]]) -> bool:
         try:
             config = self._reload_config()
             runner = self._task_runner
@@ -186,9 +189,93 @@ class RuntimeSchedulerService:
                 raise RuntimeError("runtime scheduled analysis reported failure")
             self._last_success_at = datetime.now().isoformat()
             self._last_error = None
+            return True
         except Exception as exc:  # noqa: BLE001 - scheduled runs must not kill API process.
             self._last_error = str(exc)
             logger.exception("Runtime scheduled analysis failed: %s", exc)
+            return False
+
+    @staticmethod
+    def _analysis_timeout_seconds() -> int:
+        raw = os.getenv(
+            RUNTIME_SCHEDULER_TIMEOUT_ENV,
+            str(DEFAULT_RUNTIME_SCHEDULER_TIMEOUT_SECONDS),
+        )
+        try:
+            return max(60, int(raw))
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid %s=%r; using %ss",
+                RUNTIME_SCHEDULER_TIMEOUT_ENV,
+                raw,
+                DEFAULT_RUNTIME_SCHEDULER_TIMEOUT_SECONDS,
+            )
+            return DEFAULT_RUNTIME_SCHEDULER_TIMEOUT_SECONDS
+
+    def _run_analysis_child(self, stock_codes: Optional[List[str]], result_queue) -> None:
+        """Run one analysis in a killable process and return only its outcome."""
+        result_queue.put(self._run_analysis_locked(stock_codes))
+
+    def _run_analysis_with_watchdog(self, stock_codes: Optional[List[str]] = None) -> bool:
+        """Run analysis out-of-process so a stuck provider cannot stop scheduling."""
+        if not self._run_lock.acquire(blocking=False):
+            self._record_analysis_busy_skip()
+            return False
+        try:
+            self._last_run_at = datetime.now().isoformat()
+            context = multiprocessing.get_context("fork")
+            result_queue = context.Queue()
+            worker = context.Process(
+                target=self._run_analysis_child,
+                args=(stock_codes, result_queue),
+                name="scheduled-analysis-worker",
+            )
+            worker.start()
+            timeout = self._analysis_timeout_seconds()
+            worker.join(timeout=timeout)
+
+            if worker.is_alive():
+                logger.error(
+                    "Runtime scheduled analysis exceeded %ss; terminating worker pid=%s",
+                    timeout,
+                    worker.pid,
+                )
+                worker.terminate()
+                worker.join(timeout=30)
+                if worker.is_alive():
+                    worker.kill()
+                    worker.join(timeout=10)
+                self._last_error = f"scheduled analysis timed out after {timeout}s"
+                return False
+
+            try:
+                success = bool(result_queue.get(timeout=2))
+            except Exception:
+                success = False
+                self._last_error = f"scheduled analysis worker exited with code {worker.exitcode}"
+            finally:
+                result_queue.close()
+                result_queue.join_thread()
+
+            if success:
+                self._last_success_at = datetime.now().isoformat()
+                self._last_error = None
+            elif self._last_error is None:
+                self._last_error = f"scheduled analysis worker reported failure (exit={worker.exitcode})"
+            return success
+        finally:
+            self._run_lock.release()
+
+    def _start_analysis_watchdog(self, stock_codes: Optional[List[str]] = None) -> bool:
+        """Start watchdog work asynchronously so the scheduler loop never blocks."""
+        worker = threading.Thread(
+            target=self._run_analysis_with_watchdog,
+            args=(stock_codes,),
+            daemon=True,
+            name="scheduled-analysis-watchdog",
+        )
+        worker.start()
+        return True
 
     def _run_analysis_once(self, stock_codes: Optional[List[str]] = None) -> bool:
         if not self._run_lock.acquire(blocking=False):
@@ -285,9 +372,9 @@ class RuntimeSchedulerService:
                 register_signals=False,
             )
             if run_immediately and self._run_immediately_in_background:
-                scheduler.set_daily_task(self._run_analysis_once, run_immediately=False)
+                scheduler.set_daily_task(self._start_analysis_watchdog, run_immediately=False)
             else:
-                scheduler.set_daily_task(self._run_analysis_once, run_immediately=run_immediately)
+                scheduler.set_daily_task(self._start_analysis_watchdog, run_immediately=run_immediately)
             for entry in background_tasks:
                 scheduler.add_background_task(
                     entry["task"],
@@ -296,7 +383,7 @@ class RuntimeSchedulerService:
                     name=entry.get("name"),
                 )
             if run_immediately and self._run_immediately_in_background:
-                self._run_in_background_thread(self._run_analysis_once)
+                self._run_in_background_thread(self._start_analysis_watchdog)
             thread = threading.Thread(
                 target=scheduler.run,
                 daemon=True,
