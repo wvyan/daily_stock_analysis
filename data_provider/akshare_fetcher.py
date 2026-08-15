@@ -1710,17 +1710,31 @@ class AkshareFetcher(BaseFetcher):
             import time as _time
             api_start = _time.time()
             
-            df = ak.stock_cyq_em(symbol=stock_code)
-            
+            # Eastmoney occasionally closes the connection without a response.
+            # Retry the same request briefly before declaring chip data unavailable;
+            # this endpoint is the only native A-share chip-distribution source.
+            df = None
+            last_error = None
+            for attempt in range(3):
+                try:
+                    df = ak.stock_cyq_em(symbol=stock_code)
+                    if df is not None and not df.empty:
+                        break
+                    last_error = RuntimeError("empty chip distribution response")
+                except Exception as exc:
+                    last_error = exc
+                    logger.warning(
+                        f"[筹码分布] {stock_code} 第 {attempt + 1}/3 次请求失败: {exc}"
+                    )
+                if attempt < 2:
+                    _time.sleep(1.5 * (attempt + 1))
+
             api_elapsed = _time.time() - api_start
-            
-            if df.empty:
-                logger.warning(f"[API返回] ak.stock_cyq_em 返回空数据, 耗时 {api_elapsed:.2f}s")
+            if df is None or df.empty:
+                if last_error is not None:
+                    raise last_error
                 return None
-            
-            logger.info(f"[API返回] ak.stock_cyq_em 成功: 返回 {len(df)} 天数据, 耗时 {api_elapsed:.2f}s")
-            logger.debug(f"[API返回] 筹码数据列名: {list(df.columns)}")
-            
+
             # 取最新一天的数据
             latest = df.iloc[-1]
             

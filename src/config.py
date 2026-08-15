@@ -162,7 +162,7 @@ def parse_prompt_cache_diagnostics_level(value: Optional[str]) -> str:
 
 
 AGENT_MAX_STEPS_DEFAULT = 10
-FUNDAMENTAL_STAGE_TIMEOUT_SECONDS_DEFAULT = 8.0
+FUNDAMENTAL_STAGE_TIMEOUT_SECONDS_DEFAULT = 30.0
 NEWS_STRATEGY_WINDOWS: Dict[str, int] = {
     "ultra_short": 1,
     "short": 3,

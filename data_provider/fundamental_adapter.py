@@ -261,6 +261,24 @@ def _extract_latest_row(df: pd.DataFrame, stock_code: str) -> Optional[pd.Series
     return df.iloc[0]
 
 
+def _extract_financial_abstract_row(df: pd.DataFrame, stock_code: str) -> Optional[pd.Series]:
+    """Convert AkShare's wide financial abstract into a metric-indexed row."""
+    if df is not None and not df.empty and "指标" in df.columns:
+        date_cols = sorted(
+            [str(c) for c in df.columns if re.fullmatch(r"\d{8}", str(c))],
+            reverse=True,
+        )
+        if date_cols:
+            latest_col = date_cols[0]
+            values: Dict[str, Any] = {"报告期": latest_col}
+            for _, item in df.iterrows():
+                metric = _safe_str(item.get("指标"))
+                if metric and metric not in values:
+                    values[metric] = item.get(latest_col)
+            return pd.Series(values)
+    return _extract_latest_row(df, stock_code)
+
+
 class AkshareFundamentalAdapter:
     """AkShare adapter for fundamentals, capital flow and dragon-tiger signals."""
 
@@ -310,7 +328,7 @@ class AkshareFundamentalAdapter:
         ])
         result["errors"].extend(fin_errors)
         if fin_df is not None:
-            row = _extract_latest_row(fin_df, stock_code)
+            row = _extract_financial_abstract_row(fin_df, stock_code)
             if row is not None:
                 revenue_yoy = _safe_float(_pick_by_keywords(row, ["营业收入同比", "营收同比", "收入同比", "同比增长"]))
                 profit_yoy = _safe_float(_pick_by_keywords(row, ["净利润同比", "净利同比", "归母净利润同比"]))

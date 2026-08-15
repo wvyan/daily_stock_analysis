@@ -88,3 +88,15 @@ static/
 /apps/dsa-desktop/dist/
 /apps/dsa-desktop/node_modules/
 docs/specs/
+
+# Server runtime secrets and local recovery artifacts
+/.envbackup
+/runtime_config/
+/longbridge_tokens/
+/backups/
+/data_provider/data_provider/
+/docker/*.bak*
+/docker/*.diff
+/docker/*.upstream-before-*
+/*.cherry-pick-conflict-*
+/*.pre-deduplicate-*
