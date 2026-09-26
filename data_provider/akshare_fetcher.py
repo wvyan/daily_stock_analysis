@@ -1644,6 +1644,14 @@ class AkshareFetcher(BaseFetcher):
             api_elapsed = _time.time() - api_start
             logger.info(f"[API返回] ak.stock_hk_spot 成功: 返回 {len(df_spot)} 只港股, 耗时 {api_elapsed:.2f}s")
 
+            if not isinstance(df_spot, pd.DataFrame) or '代码' not in df_spot.columns:
+                raise TypeError("stock_hk_spot 未返回含代码列的 DataFrame")
+            # ponytail: 复用已有全市场缓存；若备用源变慢，不再让每个持仓重复拉取全市场。
+            with _hk_realtime_cache_lock:
+                _hk_realtime_cache['data'] = df_spot
+                _hk_realtime_cache['timestamp'] = time.time()
+                _hk_realtime_cache['last_result'] = 'success'
+
             row = df_spot[df_spot['代码'] == code]
             if row.empty:
                 logger.info(f"[API返回] 未找到港股 {code} 的实时行情 (stock_hk_spot)")
